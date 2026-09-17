@@ -1,5 +1,10 @@
 # sqlmesh-mcp
 
+[![CI](https://github.com/Zain-ul-Abdin45/sqlmesh-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/Zain-ul-Abdin45/sqlmesh-mcp/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/sqlmesh-mcp.svg)](https://pypi.org/project/sqlmesh-mcp/)
+[![Python](https://img.shields.io/pypi/pyversions/sqlmesh-mcp.svg)](https://pypi.org/project/sqlmesh-mcp/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 MCP server exposing a [SQLMesh](https://github.com/SQLMesh/sqlmesh) project to LLM agents: model metadata, plan previews, column-level lineage, audits/tests, and environment diffs.
 
 Not officially affiliated with SQLMesh or Tobiko Data.
@@ -29,6 +34,41 @@ Point it at a SQLMesh project directory:
 }
 ```
 
+## Example
+
+Calling `list_models` against [`examples/demo_project`](examples/demo_project) (a stock `sqlmesh init duckdb` project) returns:
+
+```json
+[
+  {
+    "name": "sqlmesh_example.full_model",
+    "kind": "FULL",
+    "description": null,
+    "owner": null,
+    "tags": [],
+    "columns": { "item_id": "INT", "num_orders": "BIGINT" }
+  },
+  {
+    "name": "sqlmesh_example.incremental_model",
+    "kind": "INCREMENTAL_BY_TIME_RANGE",
+    "description": null,
+    "owner": null,
+    "tags": [],
+    "columns": { "id": "INT", "item_id": "INT", "event_date": "DATE" }
+  },
+  {
+    "name": "sqlmesh_example.seed_model",
+    "kind": "SEED",
+    "description": null,
+    "owner": null,
+    "tags": [],
+    "columns": { "id": "INT", "item_id": "INT", "event_date": "DATE" }
+  }
+]
+```
+
+From there, `lineage("sqlmesh_example.full_model", "num_orders")` traces that column back to `incremental_model.id` — the kind of question this server exists for.
+
 ## Tools
 
 | Tool | Read-only? | Description |
@@ -45,6 +85,12 @@ Point it at a SQLMesh project directory:
 | `run` | **No** | Execute scheduled/due model runs for an environment (what a cron trigger would do). Requires `confirm=true`. |
 
 `apply_plan` and `run` are the two tools that change real data in whatever warehouse the project points at. Every other tool is read-only. Both are marked `destructiveHint`/non-`readOnlyHint` in their MCP tool annotations so clients can warn a user before calling them.
+
+One server process is scoped to a single SQLMesh project, set once via `SQLMESH_PROJECT_PATH` (the context is cached for the life of the process). Point a client at multiple projects by running multiple server instances, one per `SQLMESH_PROJECT_PATH`.
+
+### Not yet covered
+
+SQLMesh's `table_diff` and `format` commands aren't exposed as tools yet — planned, not forgotten. Contributions welcome.
 
 ## Testing
 

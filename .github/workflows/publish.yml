@@ -1,0 +1,42 @@
+name: Publish to PyPI
+
+# Triggered by cutting a GitHub Release (tag it vX.Y.Z to match pyproject.toml's
+# `version`). Uses PyPI Trusted Publishing (OIDC) -- no API token stored in
+# this repo. The corresponding "pending publisher" must be configured once on
+# pypi.org (Account Settings -> Publishing) for the sqlmesh-mcp project,
+# pointing at this repo, this workflow filename, and the `pypi` environment
+# below, before the first release is cut.
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build
+      - run: python -m build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/sqlmesh-mcp/
+    permissions:
+      id-token: write # required for trusted publishing
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
