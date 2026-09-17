@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+.DS_Store
+
+# SQLMesh runtime artifacts from running the demo project / tests
+*.db
+*.db.wal
+examples/demo_project/.cache/
+examples/demo_project/logs/
