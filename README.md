@@ -41,8 +41,14 @@ Point it at a SQLMesh project directory:
 | `run_audit` | Yes | Run a model's audits |
 | `run_test` | Yes | Run a model's unit tests |
 | `diff_environment` | Yes | Diff two environments |
+| `list_environments` | Yes | List every environment that exists in the project's state |
+| `run` | **No** | Execute scheduled/due model runs for an environment (what a cron trigger would do). Requires `confirm=true`. |
 
-`apply_plan` is the one tool that changes real data in whatever warehouse the project points at. Every other tool is read-only.
+`apply_plan` and `run` are the two tools that change real data in whatever warehouse the project points at. Every other tool is read-only. Both are marked `destructiveHint`/non-`readOnlyHint` in their MCP tool annotations so clients can warn a user before calling them.
+
+## Testing
+
+See [`TEST_CASES.md`](TEST_CASES.md) for a plain-English index of every test case and what it covers, including a real bug the protocol-level tests caught that direct function-call tests couldn't (tool errors getting silently replaced with a generic message unless raised as the SDK's own `ToolError`).
 
 ## License
 

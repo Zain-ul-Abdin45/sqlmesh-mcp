@@ -6,12 +6,15 @@ changes real data in whatever warehouse the project points at.
 
 from __future__ import annotations
 
+import functools
 from typing import Any
 
 import sqlglot
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 from mcp_types import ToolAnnotations
 from sqlmesh.core.lineage import column_dependencies
+from sqlmesh.utils.errors import SQLMeshError
 
 from .context import get_context
 
@@ -22,6 +25,25 @@ server = MCPServer("sqlmesh-mcp")
 # and re-running plan() at apply time could compute something different if the
 # project changed in between preview and apply.
 _PLAN_CACHE: dict[str, Any] = {}
+
+
+def _translate_errors(fn):
+    """Without this, the MCP SDK treats any exception that isn't a ToolError as
+    a crash: the agent sees only the generic "Error executing tool <name>" and
+    the real message (e.g. SQLMesh's "Apply a plan first") is dropped, visible
+    only in server-side logs. SQLMeshError covers every error the underlying
+    library itself raises intentionally, so translating it is always safe to
+    show the agent -- it's exactly the informative half of the message.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return fn(*args, **kwargs)
+        except SQLMeshError as e:
+            raise ToolError(str(e)) from e
+
+    return wrapper
 
 
 def _snapshot_model_name(snapshot_id: Any) -> str:
@@ -45,6 +67,7 @@ def _model_summary(model: Any) -> dict:
 
 
 @server.tool(annotations=ToolAnnotations(read_only_hint=True))
+@_translate_errors
 def list_models() -> list[dict]:
     """List every model in the SQLMesh project with its kind, columns, owner, and description."""
     ctx = get_context()
@@ -52,6 +75,7 @@ def list_models() -> list[dict]:
 
 
 @server.tool(annotations=ToolAnnotations(read_only_hint=True))
+@_translate_errors
 def get_model(model_name: str) -> dict:
     """Full detail for one model: rendered query, columns, kind, owner, tags, description."""
     ctx = get_context()
@@ -62,6 +86,7 @@ def get_model(model_name: str) -> dict:
 
 
 @server.tool(annotations=ToolAnnotations(read_only_hint=True))
+@_translate_errors
 def plan(environment: str | None = None, select_models: list[str] | None = None) -> dict:
     """Preview what a plan against an environment would change. Does not apply anything.
 
@@ -88,6 +113,7 @@ def plan(environment: str | None = None, select_models: list[str] | None = None)
 
 
 @server.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=True))
+@_translate_errors
 def apply_plan(plan_id: str, confirm: bool = False) -> dict:
     """Apply a previously-previewed plan. THIS CHANGES REAL DATA in the target warehouse.
 
@@ -95,13 +121,13 @@ def apply_plan(plan_id: str, confirm: bool = False) -> dict:
     plans aren't kept across server restarts.
     """
     if not confirm:
-        raise ValueError(
+        raise ToolError(
             "Refusing to apply without confirm=true -- this changes real data "
             "in the target warehouse."
         )
     p = _PLAN_CACHE.get(plan_id)
     if p is None:
-        raise ValueError(
+        raise ToolError(
             f"No cached plan with id {plan_id!r}. Call plan() again in this session first."
         )
     ctx = get_context()
@@ -111,6 +137,7 @@ def apply_plan(plan_id: str, confirm: bool = False) -> dict:
 
 
 @server.tool(annotations=ToolAnnotations(read_only_hint=True))
+@_translate_errors
 def lineage(model_name: str, column: str) -> dict:
     """Column-level lineage: which upstream models/columns does this column depend on."""
     ctx = get_context()
@@ -119,6 +146,7 @@ def lineage(model_name: str, column: str) -> dict:
 
 
 @server.tool(annotations=ToolAnnotations(read_only_hint=True))
+@_translate_errors
 def run_audit(
     model_name: str | None = None,
     start: str | None = None,
@@ -131,6 +159,7 @@ def run_audit(
 
 
 @server.tool(annotations=ToolAnnotations(read_only_hint=True))
+@_translate_errors
 def run_test(model_name: str | None = None) -> dict:
     """Run unit tests for a model (or all tests if omitted)."""
     ctx = get_context()
@@ -144,11 +173,55 @@ def run_test(model_name: str | None = None) -> dict:
 
 
 @server.tool(annotations=ToolAnnotations(read_only_hint=True))
+@_translate_errors
 def diff_environment(environment: str) -> dict:
     """Diff the current context against a target environment."""
     ctx = get_context()
     has_diff = ctx.diff(environment=environment)
     return {"environment": environment, "has_diff": has_diff}
+
+
+@server.tool(annotations=ToolAnnotations(read_only_hint=True))
+@_translate_errors
+def list_environments() -> list[dict]:
+    """List every environment that exists in this project's state (e.g. prod, dev, ...)."""
+    ctx = get_context()
+    envs = ctx.state_reader.get_environments()
+    return [
+        {
+            "name": e.name,
+            "plan_id": e.plan_id,
+            "start_at": str(e.start_at) if e.start_at else None,
+            "end_at": str(e.end_at) if e.end_at else None,
+            "finalized_ts": e.finalized_ts,
+            "expiration_ts": e.expiration_ts,
+        }
+        for e in envs
+    ]
+
+
+@server.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=True))
+@_translate_errors
+def run(
+    environment: str | None = None,
+    confirm: bool = False,
+    start: str | None = None,
+    end: str | None = None,
+) -> dict:
+    """Execute scheduled/due model runs for an environment. THIS CHANGES REAL DATA.
+
+    Distinct from plan/apply_plan: this runs already-promoted models for their
+    due intervals (what a cron trigger would do), rather than previewing or
+    promoting structural changes. Requires confirm=true.
+    """
+    if not confirm:
+        raise ToolError(
+            "Refusing to run without confirm=true -- this changes real data "
+            "in the target warehouse."
+        )
+    ctx = get_context()
+    status = ctx.run(environment=environment, start=start, end=end)
+    return {"status": status.name, "environment": environment}
 
 
 def main() -> None:

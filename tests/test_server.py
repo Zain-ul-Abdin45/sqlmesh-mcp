@@ -1,13 +1,17 @@
 """Integration tests against the real demo SQLMesh project in examples/demo_project.
 
 These call the underlying tool functions directly (not through the MCP
-protocol layer) to keep the tests fast and focused on our own logic --
-the MCP transport itself is the SDK's responsibility, not ours.
+protocol layer -- see test_protocol.py for that) to keep them fast and
+focused on our own logic.
+
+See TEST_CASES.md for a plain-English index of every case covered here and
+in test_protocol.py.
 """
 
 from pathlib import Path
 
 import pytest
+from mcp.server.mcpserver.exceptions import ToolError
 
 DEMO_PROJECT = Path(__file__).parent.parent / "examples" / "demo_project"
 
@@ -22,6 +26,11 @@ def project_env(monkeypatch):
     get_context.cache_clear()
     yield
     get_context.cache_clear()
+
+
+# ---------------------------------------------------------------------------
+# Read-only tools that don't require a prior plan/apply
+# ---------------------------------------------------------------------------
 
 
 def test_list_models_returns_the_demo_project_models():
@@ -46,10 +55,10 @@ def test_get_model_includes_rendered_query():
     assert "seed_model" in model["query"]
 
 
-def test_get_model_raises_for_unknown_model():
+def test_get_model_raises_tool_error_with_the_real_message_for_unknown_model():
     from sqlmesh_mcp.server import get_model
 
-    with pytest.raises(Exception):
+    with pytest.raises(ToolError, match="does_not_exist"):
         get_model("sqlmesh_example.does_not_exist")
 
 
@@ -75,6 +84,17 @@ def test_run_test_passes_on_the_untouched_demo_project():
     assert result["errors"] == []
 
 
+def test_list_environments_is_empty_before_anything_is_applied():
+    from sqlmesh_mcp.server import list_environments
+
+    assert list_environments() == []
+
+
+# ---------------------------------------------------------------------------
+# plan() / apply_plan() -- the two-step preview/confirm flow
+# ---------------------------------------------------------------------------
+
+
 def test_plan_previews_the_initial_environment_without_applying():
     from sqlmesh_mcp.server import _PLAN_CACHE, plan
 
@@ -96,14 +116,14 @@ def test_apply_plan_refuses_without_confirm():
     from sqlmesh_mcp.server import apply_plan, plan
 
     p = plan(environment="dev_confirm_check")
-    with pytest.raises(ValueError, match="confirm=true"):
+    with pytest.raises(ToolError, match="confirm=true"):
         apply_plan(p["plan_id"], confirm=False)
 
 
 def test_apply_plan_rejects_unknown_plan_id():
     from sqlmesh_mcp.server import apply_plan
 
-    with pytest.raises(ValueError, match="No cached plan"):
+    with pytest.raises(ToolError, match="No cached plan"):
         apply_plan("not-a-real-plan-id", confirm=True)
 
 
@@ -114,3 +134,59 @@ def test_apply_plan_actually_applies_when_confirmed():
     result = apply_plan(p["plan_id"], confirm=True)
     assert result["applied"] is True
     assert p["plan_id"] not in _PLAN_CACHE
+
+
+# ---------------------------------------------------------------------------
+# Tools that only make sense once a plan has actually been applied --
+# run_audit and diff_environment were previously completely untested; calling
+# either against an unversioned project raises a SQLMeshError (confirmed
+# manually: "Cannot audit ... it has not been versioned yet. Apply a plan
+# first."), so these fixtures apply a real plan before exercising them.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def applied_prod_env():
+    """Plans and applies against 'prod' so audits/diffs/runs have real, versioned data."""
+    from sqlmesh_mcp.server import apply_plan, plan
+
+    p = plan(environment="prod")
+    apply_plan(p["plan_id"], confirm=True)
+    return "prod"
+
+
+def test_run_audit_passes_once_the_project_has_been_applied(applied_prod_env):
+    from sqlmesh_mcp.server import run_audit
+
+    result = run_audit()
+    assert result["passed"] is True
+
+
+def test_diff_environment_shows_no_diff_immediately_after_apply(applied_prod_env):
+    from sqlmesh_mcp.server import diff_environment
+
+    result = diff_environment(applied_prod_env)
+    assert result == {"environment": "prod", "has_diff": False}
+
+
+def test_list_environments_shows_the_applied_environment(applied_prod_env):
+    from sqlmesh_mcp.server import list_environments
+
+    envs = list_environments()
+    names = {e["name"] for e in envs}
+    assert "prod" in names
+
+
+def test_run_reports_nothing_to_do_immediately_after_apply(applied_prod_env):
+    """apply_plan already backfilled every interval, so a run right after has nothing due."""
+    from sqlmesh_mcp.server import run
+
+    result = run(environment=applied_prod_env, confirm=True)
+    assert result["status"] == "NOTHING_TO_DO"
+
+
+def test_run_refuses_without_confirm(applied_prod_env):
+    from sqlmesh_mcp.server import run
+
+    with pytest.raises(ToolError, match="confirm=true"):
+        run(environment=applied_prod_env, confirm=False)
