@@ -8,6 +8,7 @@ See TEST_CASES.md for a plain-English index of every case covered here and
 in test_protocol.py.
 """
 
+import json
 from pathlib import Path
 
 import pytest
@@ -88,6 +89,13 @@ def test_list_environments_is_empty_before_anything_is_applied():
     from sqlmesh_mcp.server import list_environments
 
     assert list_environments() == []
+
+
+def test_profile_model_requires_an_applied_model():
+    from sqlmesh_mcp.server import profile_model
+
+    with pytest.raises(ToolError):
+        profile_model("sqlmesh_example.incremental_model")
 
 
 # ---------------------------------------------------------------------------
@@ -190,3 +198,229 @@ def test_run_refuses_without_confirm(applied_prod_env):
 
     with pytest.raises(ToolError, match="confirm=true"):
         run(environment=applied_prod_env, confirm=False)
+
+
+# ---------------------------------------------------------------------------
+# profile_model / propose_cleansing_plan / apply_cleansing_plan -- dataveil's
+# aggregate-only profiling + plan-based cleansing, wired in as new tools.
+# incremental_model.sql has a synthetic 'customer_email' column added
+# specifically for this demo (see the model's comment).
+# ---------------------------------------------------------------------------
+
+
+def test_profile_model_never_contains_a_literal_email(applied_prod_env):
+    from sqlmesh_mcp.server import profile_model
+
+    profile = profile_model("sqlmesh_example.incremental_model")
+    assert profile["row_count"] > 0
+    columns = {c["name"]: c for c in profile["columns"]}
+    assert "customer_email" in columns
+    assert columns["customer_email"]["format_signatures"]
+
+    serialized = json.dumps(profile)
+    assert "user1@example.com" not in serialized
+    assert "@example.com" not in serialized  # not even the constant suffix
+
+
+def test_propose_cleansing_plan_tags_the_synthetic_email_column(applied_prod_env):
+    from sqlmesh_mcp.server import propose_cleansing_plan
+
+    proposal = propose_cleansing_plan("sqlmesh_example.incremental_model")
+    assert proposal["model"] == "sqlmesh_example.incremental_model"
+    tags = {c["column"]: c["tag"] for c in proposal["classifications"]}
+    assert tags["customer_email"] == "PII:EMAIL"
+    assert tags["event_date"] == "none"  # a DATE column, not a false-positive phone match
+    assert "mask" in proposal["operation_vocabulary"]
+    assert "drop_column" in proposal["operation_vocabulary"]
+
+
+def test_profile_classify_and_apply_are_all_audit_logged(applied_prod_env, tmp_path, monkeypatch):
+    """Runs before the masking tests below -- it needs customer_email still
+    unmasked to see PII:EMAIL classified, and it masks it itself here."""
+    from dataveil.audit import AuditLog
+
+    from sqlmesh_mcp.server import apply_cleansing_plan, profile_model, propose_cleansing_plan
+
+    log_path = tmp_path / "audit.jsonl"
+    monkeypatch.setenv("DATAVEIL_AUDIT_LOG_PATH", str(log_path))
+
+    profile_model("sqlmesh_example.incremental_model")
+    proposal = propose_cleansing_plan("sqlmesh_example.incremental_model")
+    tags = {c["column"]: c["tag"] for c in proposal["classifications"]}
+    assert tags["customer_email"] == "PII:EMAIL"
+    mask_plan = [
+        {
+            "operation": "mask",
+            "column": "customer_email",
+            "params": {"method": "hash"},
+            "rationale": "x",
+        }
+    ]
+    apply_cleansing_plan("sqlmesh_example.incremental_model", mask_plan, confirm=True)
+
+    events = AuditLog(log_path).read_all()
+    kinds = [e.kind for e in events]
+    assert kinds == ["profile", "classify", "execute_plan"]
+    assert all(e.table == "sqlmesh_example.incremental_model" for e in events)
+    # never a literal value -- just counts/tags/operation references
+    serialized = json.dumps([e.to_dict() for e in events])
+    assert "user1@example.com" not in serialized
+
+
+def test_apply_cleansing_plan_refuses_without_confirm(applied_prod_env):
+    from sqlmesh_mcp.server import apply_cleansing_plan
+
+    with pytest.raises(ToolError, match="confirm=true"):
+        apply_cleansing_plan("sqlmesh_example.incremental_model", [], confirm=False)
+
+
+def test_apply_cleansing_plan_rejects_unknown_operation_before_touching_data(applied_prod_env):
+    from sqlmesh_mcp.server import apply_cleansing_plan
+
+    bad_plan = [
+        {
+            "operation": "drop_table",  # not in the vocabulary
+            "column": "customer_email",
+            "params": {},
+            "rationale": "x",
+        }
+    ]
+    with pytest.raises(ToolError, match="unknown operation"):
+        apply_cleansing_plan("sqlmesh_example.incremental_model", bad_plan, confirm=True)
+
+
+def test_apply_cleansing_plan_masks_the_synthetic_email_column(applied_prod_env):
+    from sqlmesh_mcp.context import get_context
+    from sqlmesh_mcp.server import apply_cleansing_plan
+
+    plan = [
+        {
+            "operation": "mask",
+            "column": "customer_email",
+            "params": {"method": "hash"},
+            "rationale": "PII:EMAIL detected at match_rate=1.0",
+        }
+    ]
+    result = apply_cleansing_plan("sqlmesh_example.incremental_model", plan, confirm=True)
+    assert result["applied_steps"][0]["operation"] == "mask"
+
+    ctx = get_context()
+    df = ctx.fetchdf("SELECT customer_email FROM sqlmesh_example.incremental_model LIMIT 1")
+    value = df["customer_email"].iloc[0]
+    assert value != "user1@example.com"
+    assert len(value) == 32  # md5 hex digest
+
+
+# ---------------------------------------------------------------------------
+# register_cleansing_plan / approve_cleansing_plan -- the optional
+# approval-gated path in front of apply_cleansing_plan, enabled by
+# DATAVEIL_REQUIRE_PLAN_APPROVAL. Off by default (the tests above never set
+# it), so apply_cleansing_plan keeps accepting a plan directly unless a
+# server opts into this.
+# ---------------------------------------------------------------------------
+
+MASK_PLAN = [
+    {
+        "operation": "mask",
+        "column": "customer_email",
+        "params": {"method": "hash"},
+        "rationale": "PII:EMAIL",
+    }
+]
+
+
+def test_register_cleansing_plan_validates_the_plan_immediately(applied_prod_env):
+    from sqlmesh_mcp.server import register_cleansing_plan
+
+    bad_plan = [
+        {"operation": "drop_table", "column": "customer_email", "params": {}, "rationale": "x"}
+    ]
+    with pytest.raises(ToolError, match="unknown operation"):
+        register_cleansing_plan("sqlmesh_example.incremental_model", bad_plan)
+
+
+def test_register_cleansing_plan_returns_an_unapproved_pending_plan(applied_prod_env):
+    from sqlmesh_mcp.server import register_cleansing_plan
+
+    result = register_cleansing_plan("sqlmesh_example.incremental_model", MASK_PLAN)
+    assert result["plan_id"]
+    assert result["model"] == "sqlmesh_example.incremental_model"
+    assert result["approved"] is False
+
+
+def test_approve_cleansing_plan_unknown_id_raises(applied_prod_env):
+    from sqlmesh_mcp.server import approve_cleansing_plan
+
+    with pytest.raises(ToolError, match="no pending plan"):
+        approve_cleansing_plan("not-a-real-id", approved_by="alice@example.com")
+
+
+def test_apply_cleansing_plan_requires_plan_id_when_approval_is_required(
+    applied_prod_env, monkeypatch
+):
+    from sqlmesh_mcp.server import apply_cleansing_plan
+
+    monkeypatch.setenv("DATAVEIL_REQUIRE_PLAN_APPROVAL", "true")
+    with pytest.raises(ToolError, match="DATAVEIL_REQUIRE_PLAN_APPROVAL"):
+        apply_cleansing_plan("sqlmesh_example.incremental_model", plan=MASK_PLAN, confirm=True)
+
+
+def test_apply_cleansing_plan_rejects_an_unapproved_plan_id(applied_prod_env, monkeypatch):
+    from sqlmesh_mcp.server import apply_cleansing_plan, register_cleansing_plan
+
+    pending = register_cleansing_plan("sqlmesh_example.incremental_model", MASK_PLAN)
+    monkeypatch.setenv("DATAVEIL_REQUIRE_PLAN_APPROVAL", "true")
+    with pytest.raises(ToolError, match="has not been approved"):
+        apply_cleansing_plan(
+            "sqlmesh_example.incremental_model", plan_id=pending["plan_id"], confirm=True
+        )
+
+
+def test_apply_cleansing_plan_rejects_a_plan_id_registered_for_a_different_model(
+    applied_prod_env, monkeypatch
+):
+    from sqlmesh_mcp.server import (
+        apply_cleansing_plan,
+        approve_cleansing_plan,
+        register_cleansing_plan,
+    )
+
+    pending = register_cleansing_plan("sqlmesh_example.incremental_model", MASK_PLAN)
+    approve_cleansing_plan(pending["plan_id"], approved_by="alice@example.com")
+    monkeypatch.setenv("DATAVEIL_REQUIRE_PLAN_APPROVAL", "true")
+    with pytest.raises(ToolError, match="was registered for"):
+        apply_cleansing_plan(
+            "sqlmesh_example.full_model", plan_id=pending["plan_id"], confirm=True
+        )
+
+
+def test_register_approve_and_apply_cleansing_plan_end_to_end(applied_prod_env, monkeypatch):
+    from sqlmesh_mcp.context import get_context
+    from sqlmesh_mcp.server import (
+        _PLAN_REGISTRY,
+        apply_cleansing_plan,
+        approve_cleansing_plan,
+        register_cleansing_plan,
+    )
+
+    pending = register_cleansing_plan("sqlmesh_example.incremental_model", MASK_PLAN)
+    approved = approve_cleansing_plan(pending["plan_id"], approved_by="alice@example.com")
+    assert approved["approved"] is True
+    assert approved["approved_by"] == "alice@example.com"
+
+    monkeypatch.setenv("DATAVEIL_REQUIRE_PLAN_APPROVAL", "true")
+    result = apply_cleansing_plan(
+        "sqlmesh_example.incremental_model", plan_id=pending["plan_id"], confirm=True
+    )
+    assert result["applied_steps"][0]["operation"] == "mask"
+
+    ctx = get_context()
+    df = ctx.fetchdf("SELECT customer_email FROM sqlmesh_example.incremental_model LIMIT 1")
+    assert len(df["customer_email"].iloc[0]) == 32  # md5 hex digest, masked again
+
+    # the plan is discarded after a successful apply -- can't be replayed
+    assert _PLAN_REGISTRY.get(pending["plan_id"]) is None
+    with pytest.raises(ToolError, match="no registered plan"):
+        apply_cleansing_plan(
+            "sqlmesh_example.incremental_model", plan_id=pending["plan_id"], confirm=True
+        )

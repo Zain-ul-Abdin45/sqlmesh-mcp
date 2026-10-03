@@ -83,8 +83,21 @@ From there, `lineage("sqlmesh_example.full_model", "num_orders")` traces that co
 | `diff_environment` | Yes | Diff two environments |
 | `list_environments` | Yes | List every environment that exists in the project's state |
 | `run` | **No** | Execute scheduled/due model runs for an environment (what a cron trigger would do). Requires `confirm=true`. |
+| `profile_model` | Yes | Aggregate-only profile of a model's columns (null rates, numeric stats, generalized string format signatures). No raw rows or samples; numeric stats withheld for small or constant columns (see dataveil's Known limits). |
+| `propose_cleansing_plan` | Yes | Profile + a local sensitivity classification per column (`PII:EMAIL`, `PII:SSN`, ...) + the operation vocabulary `apply_cleansing_plan` accepts — the contract an agent reasons over to build a plan. |
+| `apply_cleansing_plan` | **No** | Validate and apply a data-cleansing plan (mask/drop/impute/... from a closed, pre-tested operation vocabulary — never LLM-generated code). Requires `confirm=true`. |
+| `register_cleansing_plan` | Yes | Register a plan for later approval instead of applying it directly. Validates it immediately. Only useful when `DATAVEIL_REQUIRE_PLAN_APPROVAL=true` (see below). |
+| `approve_cleansing_plan` | No\* | Mark a registered plan approved by someone. Doesn't touch real data — not read-only (it mutates server-side approval state), not destructive either. |
 
-`apply_plan` and `run` are the two tools that change real data in whatever warehouse the project points at. Every other tool is read-only. Both are marked `destructiveHint`/non-`readOnlyHint` in their MCP tool annotations so clients can warn a user before calling them.
+`apply_plan`, `run`, and `apply_cleansing_plan` are the tools that change real data in whatever warehouse the project points at. Every other tool is read-only, except `approve_cleansing_plan` (marked above with \*), which mutates server-side state but never real data. All three data-changing tools are marked `destructiveHint`/non-`readOnlyHint` in their MCP tool annotations so clients can warn a user before calling them.
+
+`profile_model`/`propose_cleansing_plan`/`apply_cleansing_plan` are powered by [`dataveil`](https://github.com/Zain-ul-Abdin45/dataveil): profiling, PII classification, and plan execution happen locally against aggregate SQL only (never a sample of raw rows), and a cleansing plan can only reference a small, pre-tested operation vocabulary — never SQL or code an LLM wrote itself. See that project's README for its known limits. Note: `apply_cleansing_plan` writes directly to a model's physical snapshot table, outside SQLMesh's own state tracking — a FULL-kind model's next scheduled run/plan apply will rematerialize it and silently undo the cleansing.
+
+### Optional plan-approval gate
+
+By default, `apply_cleansing_plan` accepts a plan directly (plus `confirm=true`) — the same posture `apply_plan`/`run` already have. Setting `DATAVEIL_REQUIRE_PLAN_APPROVAL=true` adds a second, independent gate for cleansing plans specifically: `apply_cleansing_plan` then refuses a plan passed directly and instead requires a `plan_id` from a plan that was `register_cleansing_plan`'d and then `approve_cleansing_plan`'d — by a different call, potentially a different reviewer. `confirm=true` is still required on top of that approval, not instead of it. A plan is discarded from the registry once applied, so it can't be replayed. Off by default; turn it on once this touches anything with real compliance stakes.
+
+Every call to these three tools is appended to a local JSON-lines audit log (`<project>/.dataveil/audit.jsonl` by default; override with `DATAVEIL_AUDIT_LOG_PATH`) — who/what/when, enough to reconstruct what happened without re-running anything, never a literal cell value.
 
 One server process is scoped to a single SQLMesh project, set once via `SQLMESH_PROJECT_PATH` (the context is cached for the life of the process). Point a client at multiple projects by running multiple server instances, one per `SQLMESH_PROJECT_PATH`.
 

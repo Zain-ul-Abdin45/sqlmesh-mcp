@@ -42,7 +42,7 @@ async def open_session():
             yield session
 
 
-async def test_lists_all_ten_tools():
+async def test_lists_all_fifteen_tools():
     async with open_session() as session:
         tools = await session.list_tools()
         names = {t.name for t in tools.tools}
@@ -57,15 +57,30 @@ async def test_lists_all_ten_tools():
             "diff_environment",
             "list_environments",
             "run",
+            "profile_model",
+            "propose_cleansing_plan",
+            "apply_cleansing_plan",
+            "register_cleansing_plan",
+            "approve_cleansing_plan",
         }
 
 
 async def test_mutating_tools_are_flagged_destructive_and_not_read_only():
     async with open_session() as session:
         tools = {t.name: t for t in (await session.list_tools()).tools}
-        for name in ["apply_plan", "run"]:
+        for name in ["apply_plan", "run", "apply_cleansing_plan"]:
             assert tools[name].annotations.read_only_hint is False
             assert tools[name].annotations.destructive_hint is True
+
+
+async def test_approve_cleansing_plan_is_neither_read_only_nor_destructive():
+    """It mutates server-side approval state (not read-only) but never
+    touches real data (not destructive) -- a third category distinct from
+    the other two checks here."""
+    async with open_session() as session:
+        tools = {t.name: t for t in (await session.list_tools()).tools}
+        assert tools["approve_cleansing_plan"].annotations.read_only_hint is False
+        assert tools["approve_cleansing_plan"].annotations.destructive_hint is False
 
 
 async def test_read_only_tools_are_flagged_read_only():
@@ -80,6 +95,9 @@ async def test_read_only_tools_are_flagged_read_only():
             "run_test",
             "diff_environment",
             "list_environments",
+            "profile_model",
+            "propose_cleansing_plan",
+            "register_cleansing_plan",
         ]:
             assert tools[name].annotations.read_only_hint is True
 
@@ -112,6 +130,39 @@ async def test_get_model_for_unknown_model_is_a_tool_error_with_the_real_message
         text = str(result.content)
         assert "does.not_exist" in text or "does_not_exist" in text
         assert "Cannot find model" in text
+
+
+async def test_apply_cleansing_plan_without_confirm_is_a_tool_error_with_the_real_message():
+    async with open_session() as session:
+        result = await session.call_tool(
+            "apply_cleansing_plan",
+            {"model_name": "sqlmesh_example.full_model", "plan": [], "confirm": False},
+        )
+        assert result.is_error is True
+        text = str(result.content)
+        assert "confirm=true" in text
+
+
+async def test_approve_cleansing_plan_unknown_id_is_a_tool_error_with_the_real_message():
+    async with open_session() as session:
+        result = await session.call_tool(
+            "approve_cleansing_plan", {"plan_id": "not-a-real-id", "approved_by": "alice"}
+        )
+        assert result.is_error is True
+        assert "no pending plan" in str(result.content)
+
+
+async def test_register_cleansing_plan_rejects_unknown_operation_over_the_wire():
+    async with open_session() as session:
+        bad_plan = [
+            {"operation": "drop_table", "column": "item_id", "params": {}, "rationale": "x"}
+        ]
+        result = await session.call_tool(
+            "register_cleansing_plan",
+            {"model_name": "sqlmesh_example.full_model", "plan": bad_plan},
+        )
+        assert result.is_error is True
+        assert "unknown operation" in str(result.content)
 
 
 async def test_session_survives_a_tool_error_and_keeps_working():

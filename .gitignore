@@ -14,3 +14,9 @@ venv/
 *.db.wal
 examples/demo_project/.cache/
 examples/demo_project/logs/
+
+# dataveil audit log (see profile_model/propose_cleansing_plan/apply_cleansing_plan)
+.dataveil/
+
+# Internal planning doc -- not part of the published package.
+sql-mesh-phases.md
