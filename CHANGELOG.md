@@ -3,18 +3,10 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [0.1.0] - Unreleased
-
-Initial release.
+## [0.2.0] - 2026-10-03
 
 ### Added
 
-- `list_models`, `get_model` -- model metadata and rendered queries.
-- `plan`, `apply_plan` -- preview and (with `confirm=true`) apply a plan.
-- `lineage` -- column-level lineage for a model's column.
-- `run_audit`, `run_test` -- run a model's audits / unit tests.
-- `diff_environment`, `list_environments` -- inspect environment state.
-- `run` -- execute due scheduled runs for an environment (requires `confirm=true`).
 - `profile_model`, `propose_cleansing_plan`, `apply_cleansing_plan` -- local,
   aggregate-only data profiling, PII classification, and plan-based
   cleansing (mask/drop/impute/...), powered by
@@ -31,5 +23,23 @@ Initial release.
   plan be registered and approved (by a separate call, potentially a
   separate reviewer) before `apply_cleansing_plan` will run it by
   `plan_id`. Useful once this touches anything with real compliance stakes.
+
+### Changed
+
+- Depends on `dataveil[sqlmesh]>=0.2.0` from PyPI. Format signatures and
+  numeric stats follow dataveil 0.2.0's fixes; see its release notes.
+
+## [0.1.0] - 2026-09-17
+
+Initial release.
+
+### Added
+
+- `list_models`, `get_model` -- model metadata and rendered queries.
+- `plan`, `apply_plan` -- preview and (with `confirm=true`) apply a plan.
+- `lineage` -- column-level lineage for a model's column.
+- `run_audit`, `run_test` -- run a model's audits / unit tests.
+- `diff_environment`, `list_environments` -- inspect environment state.
+- `run` -- execute due scheduled runs for an environment (requires `confirm=true`).
 - Protocol-level test suite (`tests/test_protocol.py`) spawning the server
   as a real MCP client would, alongside direct function-call tests.
