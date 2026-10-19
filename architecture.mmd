@@ -1,116 +1,91 @@
 flowchart TB
-    %% ---------- Clients ----------
-    client["MCP client<br/>(Claude Desktop, other agents)"]
-    reviewer["Human reviewer<br/>(approves cleansing plans)"]
+    client["MCP client<br/>(Claude, VS Code, Cursor, agents)"]
+    reviewer["Authorized reviewer"]
 
-    %% ---------- The MCP server ----------
-    subgraph server["sqlmesh-mcp server  (src/sqlmesh_mcp/server.py, stdio)"]
-        direction TB
-        subgraph ro["Read-only tools"]
-            direction LR
-            t_models["list_models / get_model"]
-            t_plan["plan<br/>(preview, cached)"]
-            t_lineage["lineage"]
-            t_checks["run_audit / run_test"]
-            t_envs["diff_environment /<br/>list_environments"]
-        end
-        subgraph wr["Tools that change data (confirm=true)"]
-            direction LR
-            t_apply_plan["apply_plan<br/>(cached plan)"]
-            t_run["run<br/>(due model runs)"]
-            t_apply_clean["apply_cleansing_plan<br/>(plan or approved plan_id)"]
-        end
-        subgraph dv["dataveil-backed tools"]
-            direction LR
-            t_profile["profile_model<br/>(aggregate only)"]
-            t_propose["propose_cleansing_plan<br/>(profile + tags + vocabulary)"]
-            t_register["register_cleansing_plan<br/>(validates, read-only)"]
-            t_approve["approve_cleansing_plan<br/>(approval state only)"]
-        end
-        errors["_translate_errors<br/>SQLMeshError / PlanValidationError /<br/>ExecutionError / ValueError / ApprovalError<br/>become ToolError"]
+    subgraph transport["MCP transports"]
+        stdio["stdio<br/>(default)"]
+        http["Streamable HTTP<br/>Bearer token required for remote binding"]
     end
 
-    client -->|"tool calls over stdio"| server
-    reviewer -->|"approve_cleansing_plan"| t_approve
-
-    %% ---------- In-process state ----------
-    subgraph state["In-process state (lost on restart)"]
-        direction LR
-        plan_cache["_PLAN_CACHE<br/>SQLMesh Plan objects<br/>keyed by plan_id"]
-        plan_registry["_PLAN_REGISTRY<br/>dataveil PlanRegistry<br/>pending / approved plans"]
-        approval_flag["DATAVEIL_REQUIRE_PLAN_APPROVAL<br/>off by default"]
+    subgraph server["sqlmesh-mcp server"]
+        auth["Identity and scope context<br/>named clients, expiry, read/mutate/approve/write/operate"]
+        errors["Error translation<br/>SQLMesh/dataveil errors -> ToolError"]
+        ro["Read-only tools<br/>metadata, lineage, diffs, health, impact, previews"]
+        write["Mutation tools<br/>plan/apply, run, format, cleansing"]
+        jobs["Async jobs<br/>start_plan / start_run / status / cancel"]
+        resources["MCP resources and prompts<br/>models, model SQL, lineage, explain, review"]
     end
 
-    t_plan --> plan_cache
-    t_apply_plan --> plan_cache
-    t_register --> plan_registry
-    t_approve --> plan_registry
-    t_apply_clean --> plan_registry
-    t_apply_clean -.->|"checks"| approval_flag
-
-    %% ---------- SQLMesh ----------
-    subgraph sqlmesh["SQLMesh project  (SQLMESH_PROJECT_PATH)"]
-        direction TB
-        ctx["Context<br/>(cached per process,<br/>src/sqlmesh_mcp/context.py)"]
-        models["Models and config<br/>(SQL, kinds, audits, tests)"]
-        state_db[("SQLMesh state<br/>environments, snapshots")]
-        vlayer["Virtual layer<br/>schema.model views"]
-        physical[("Physical snapshot tables<br/>sqlmesh__schema.* ")]
+    subgraph safety["Safety controls"]
+        envs["Environment allowlist"]
+        readonly["SQLMESH_READ_ONLY"]
+        cache["Plan cache<br/>TTL, size limit, project/environment binding"]
+        preview["Preview controls<br/>row cap, column allowlist, masking"]
+        audit["Identity-aware audit log"]
+        approvals["Persistent approval records<br/>atomic JSON, mode 0600"]
     end
 
-    t_models --> ctx
-    t_lineage --> ctx
-    t_checks --> ctx
-    t_envs --> ctx
-    t_plan --> ctx
-    t_apply_plan --> ctx
-    t_run --> ctx
-    ctx --> models
-    ctx --> state_db
-    ctx --> vlayer
-    vlayer --> physical
-
-    %% ---------- dataveil (external package) ----------
-    subgraph dataveil["dataveil package  (PyPI, dependency dataveil[sqlmesh])"]
-        direction TB
-        dv_adapter["SQLMeshAdapter<br/>reads: virtual layer<br/>writes: physical snapshot table"]
-        dv_core["core: profile, classify,<br/>plan validation, execute,<br/>approval"]
-        dv_audit["AuditLog<br/>JSONL, who / what / when,<br/>never values"]
+    subgraph project["SQLMesh project"]
+        context["Cached SQLMesh Context"]
+        definitions["Models, audits, tests, config"]
+        state[("SQLMesh state<br/>environments and snapshots")]
+        virtual["Virtual model layer"]
+        physical[("Physical snapshot tables")]
     end
 
-    t_profile --> dv_adapter
-    t_propose --> dv_adapter
-    t_apply_clean --> dv_adapter
-    t_register --> dv_adapter
-    dv_adapter --> dv_core
-    dv_adapter --> ctx
-    t_profile -.->|"record"| dv_audit
-    t_propose -.->|"record"| dv_audit
-    t_apply_clean -.->|"record"| dv_audit
-    dv_audit --> audit_file[("<project>/.dataveil/audit.jsonl<br/>override: DATAVEIL_AUDIT_LOG_PATH")]
+    warehouse[("Warehouse engine")]
+    dataveil["dataveil<br/>profile, classify, validate, cleanse"]
+    files[("Project files<br/>approvals.json / audit.jsonl")]
+    ci["GitHub Actions<br/>ruff + pytest"]
+    tests["Direct and MCP protocol tests"]
+    pypi[("PyPI package")]
 
-    %% ---------- Warehouse ----------
-    warehouse[("Warehouse engine<br/>(DuckDB in the demo;<br/>any SQLMesh-supported engine)")]
+    client --> stdio
+    client --> http
+    stdio --> server
+    http --> auth
+    auth --> server
+    reviewer --> auth
+
+    server --> errors
+    server --> ro
+    server --> write
+    server --> jobs
+    server --> resources
+
+    write --> envs
+    write --> readonly
+    write --> cache
+    ro --> preview
+    write --> audit
+    write --> approvals
+    auth --> audit
+
+    ro --> context
+    write --> context
+    jobs --> context
+    resources --> context
+    context --> definitions
+    context --> state
+    context --> virtual
+    virtual --> physical
     physical --> warehouse
-    state_db --> warehouse
+    state --> warehouse
 
-    %% ---------- Delivery ----------
-    subgraph release["Delivery"]
-        direction LR
-        gh_ci["GitHub Actions CI<br/>ruff + pytest"]
-        tests["Tests<br/>direct calls (test_server.py)<br/>real stdio protocol (test_protocol.py)"]
-        pypi[("PyPI sqlmesh-mcp 0.1.0<br/>10 tools, no dataveil yet")]
-    end
+    dataveil --> physical
+    dataveil --> audit
+    audit --> files
+    approvals --> files
 
-    gh_ci --> tests
-    pypi -.->|"next release adds the<br/>dataveil-backed tools"| server
+    ci --> server
+    ci --> tests
+    pypi --> server
 
-    %% ---------- Styling ----------
-    classDef write fill:#fef2f2,stroke:#dc2626
-    classDef dv fill:#f0fdf4,stroke:#16a34a
-    classDef store fill:#fff7ed,stroke:#ea580c
-    classDef readonly fill:#eff6ff,stroke:#3b82f6
-    class t_apply_plan,t_run,t_apply_clean write
-    class t_profile,t_propose,t_register,t_approve,dv_adapter,dv_core,dv_audit dv
-    class state_db,physical,warehouse,audit_file,pypi store
-    class t_models,t_plan,t_lineage,t_checks,t_envs readonly
+    classDef read fill:#eff6ff,stroke:#2563eb
+    classDef mutate fill:#fef2f2,stroke:#dc2626
+    classDef security fill:#fff7ed,stroke:#ea580c
+    classDef state fill:#f0fdf4,stroke:#16a34a
+    class ro,resources read
+    class write,jobs mutate
+    class auth,envs,readonly,cache,preview,audit,approvals security
+    class context,definitions,state,virtual,physical,warehouse,files state
