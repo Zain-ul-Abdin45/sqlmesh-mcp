@@ -3,6 +3,28 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.0] - 2026-10-19
+
+### Added
+
+- Expanded SQLMesh MCP tools for model dependencies, bounded data previews,
+  asynchronous plans/runs, job status, environment health, audit history, and
+  transitive model impact analysis.
+- MCP resources and prompts for model metadata, rendered SQL, lineage, model
+  explanations, and plan reviews.
+- Streamable HTTP transport with bearer authentication, named clients, token
+  expiry, and scoped authorization.
+- Persistent cleansing-plan approvals with atomic writes and restrictive file
+  permissions.
+- Read-only deployment mode, environment allowlists, plan expiry, preview
+  masking, column filters, and identity-aware audit records.
+
+### Changed
+
+- Added Uvicorn as the HTTP transport runtime dependency.
+- Added comprehensive direct and protocol-level regression coverage for the
+  expanded tool and security surface.
+
 ## [0.2.0] - 2026-10-03
 
 ### Added
