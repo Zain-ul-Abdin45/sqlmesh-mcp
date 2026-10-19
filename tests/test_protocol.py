@@ -42,13 +42,23 @@ async def open_session():
             yield session
 
 
-async def test_lists_all_fifteen_tools():
+async def test_lists_all_twenty_seven_tools():
     async with open_session() as session:
         tools = await session.list_tools()
         names = {t.name for t in tools.tools}
         assert names == {
             "list_models",
             "get_model",
+            "get_model_dependencies",
+            "fetch_model_data",
+            "server_info",
+            "start_plan",
+            "start_run",
+            "get_job_status",
+            "cancel_job",
+            "model_impact",
+            "environment_health",
+            "audit_history",
             "plan",
             "apply_plan",
             "lineage",
@@ -56,6 +66,8 @@ async def test_lists_all_fifteen_tools():
             "run_test",
             "diff_environment",
             "list_environments",
+            "table_diff",
+            "format",
             "run",
             "profile_model",
             "propose_cleansing_plan",
@@ -90,16 +102,62 @@ async def test_read_only_tools_are_flagged_read_only():
             "list_models",
             "get_model",
             "plan",
+            "start_plan",
+            "get_job_status",
             "lineage",
             "run_audit",
             "run_test",
             "diff_environment",
             "list_environments",
+            "table_diff",
             "profile_model",
             "propose_cleansing_plan",
             "register_cleansing_plan",
+            "model_impact",
+            "environment_health",
+            "audit_history",
         ]:
             assert tools[name].annotations.read_only_hint is True
+
+
+async def test_async_run_and_cancel_are_flagged_as_mutating():
+    async with open_session() as session:
+        tools = {t.name: t for t in (await session.list_tools()).tools}
+        assert tools["start_run"].annotations.destructive_hint is True
+        assert tools["start_run"].annotations.read_only_hint is False
+        assert tools["cancel_job"].annotations.destructive_hint is False
+        assert tools["cancel_job"].annotations.read_only_hint is False
+
+
+async def test_format_is_mutating_but_not_destructive():
+    async with open_session() as session:
+        tool = next(t for t in (await session.list_tools()).tools if t.name == "format")
+        assert tool.annotations.read_only_hint is False
+        assert tool.annotations.destructive_hint is False
+
+
+async def test_lists_resources_and_prompts():
+    async with open_session() as session:
+        resources = await session.list_resources()
+        assert {resource.name for resource in resources.resources} == {"models"}
+
+        prompts = await session.list_prompts()
+        assert {prompt.name for prompt in prompts.prompts} == {"explain_model", "review_plan"}
+
+
+async def test_reads_model_resource_over_the_protocol():
+    async with open_session() as session:
+        result = await session.read_resource("sqlmesh://models/sqlmesh_example.full_model")
+        assert "sqlmesh_example.full_model" in str(result.contents)
+        assert "num_orders" in str(result.contents)
+
+
+async def test_gets_model_explanation_prompt_over_the_protocol():
+    async with open_session() as session:
+        result = await session.get_prompt(
+            "explain_model", {"model_name": "sqlmesh_example.full_model"}
+        )
+        assert "sqlmesh_example.full_model" in str(result.messages)
 
 
 async def test_list_models_call_round_trips_real_data():

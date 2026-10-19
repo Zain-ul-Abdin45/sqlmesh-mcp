@@ -56,6 +56,230 @@ def test_get_model_includes_rendered_query():
     assert "seed_model" in model["query"]
 
 
+def test_get_model_dependencies_returns_upstream_and_downstream_models():
+    from sqlmesh_mcp.server import get_model_dependencies
+
+    dependencies = get_model_dependencies("sqlmesh_example.full_model")
+    assert dependencies["model"] == "sqlmesh_example.full_model"
+    assert any("incremental_model" in name for name in dependencies["upstream"])
+
+
+def test_model_impact_returns_transitive_dependencies():
+    from sqlmesh_mcp.server import model_impact
+
+    impact = model_impact("sqlmesh_example.seed_model")
+    assert any("full_model" in name for name in impact["downstream"])
+
+
+def test_get_job_status_rejects_unknown_job():
+    from sqlmesh_mcp.server import get_job_status
+
+    with pytest.raises(ToolError, match="No job"):
+        get_job_status("not-a-real-job")
+
+
+def test_start_plan_completes_as_a_background_job():
+    from time import monotonic, sleep
+
+    from sqlmesh_mcp.server import get_job_status, start_plan
+
+    submitted = start_plan(environment="background_check")
+    deadline = monotonic() + 5
+    status = get_job_status(submitted["job_id"])
+    while status["status"] in {"queued", "running"} and monotonic() < deadline:
+        sleep(0.02)
+        status = get_job_status(submitted["job_id"])
+    assert status["status"] == "completed"
+    assert status["result"]["environment"] == "background_check"
+
+
+def test_environment_health_reports_missing_environment():
+    from sqlmesh_mcp.server import environment_health
+
+    result = environment_health("not_created")
+    assert result == {"environment": "not_created", "exists": False, "healthy": False}
+
+
+def test_read_only_mode_rejects_mutating_tools(monkeypatch):
+    from sqlmesh_mcp.server import apply_plan, format, run
+
+    monkeypatch.setenv("SQLMESH_READ_ONLY", "true")
+    with pytest.raises(ToolError, match="SQLMESH_READ_ONLY"):
+        apply_plan("fake", confirm=True)
+    with pytest.raises(ToolError, match="SQLMESH_READ_ONLY"):
+        format(check=False, confirm=True)
+    with pytest.raises(ToolError, match="SQLMESH_READ_ONLY"):
+        run(environment="prod", confirm=True)
+
+
+def test_server_info_reports_project_and_result_limit(monkeypatch):
+    from sqlmesh_mcp.server import server_info
+
+    monkeypatch.setenv("SQLMESH_MAX_RESULT_ROWS", "7")
+    info = server_info()
+    assert info["model_count"] == 3
+    assert info["max_result_rows"] == 7
+    assert info["transport"] == "stdio"
+
+
+def test_fetch_model_data_enforces_the_configured_row_limit(monkeypatch):
+    from sqlmesh_mcp.server import fetch_model_data
+
+    monkeypatch.setenv("SQLMESH_MAX_RESULT_ROWS", "1")
+    with pytest.raises(ToolError, match="between 1 and 1"):
+        fetch_model_data("sqlmesh_example.seed_model", limit=2)
+
+
+def test_fetch_model_data_rejects_unknown_columns():
+    from sqlmesh_mcp.server import fetch_model_data
+
+    with pytest.raises(ToolError, match="Unknown preview columns"):
+        fetch_model_data("sqlmesh_example.seed_model", columns=["not_a_column"])
+
+
+def test_fetch_model_data_requires_opt_in_for_unmasked_values():
+    from sqlmesh_mcp.server import fetch_model_data
+
+    with pytest.raises(ToolError, match="ALLOW_UNMASKED_PREVIEW"):
+        fetch_model_data("sqlmesh_example.seed_model", mask_sensitive=False)
+
+
+def test_table_diff_enforces_the_global_row_limit(monkeypatch):
+    from sqlmesh_mcp.server import table_diff
+
+    monkeypatch.setenv("SQLMESH_MAX_RESULT_ROWS", "1")
+    with pytest.raises(ToolError, match="between 1 and 1"):
+        table_diff("source", "target", limit=2)
+
+
+def test_environment_allowlist_rejects_unapproved_environment(monkeypatch):
+    from sqlmesh_mcp.server import diff_environment
+
+    monkeypatch.setenv("SQLMESH_ALLOWED_ENVIRONMENTS", "prod,staging")
+    with pytest.raises(ToolError, match="not allowed"):
+        diff_environment("development")
+
+
+def test_plan_requires_an_explicit_environment_when_allowlist_is_configured(monkeypatch):
+    from sqlmesh_mcp.server import plan
+
+    monkeypatch.setenv("SQLMESH_ALLOWED_ENVIRONMENTS", "prod,staging")
+    with pytest.raises(ToolError, match="explicit environment"):
+        plan()
+
+
+def test_remote_http_binding_is_rejected_without_explicit_opt_in(monkeypatch):
+    from sqlmesh_mcp import server as server_module
+
+    monkeypatch.setenv("MCP_TRANSPORT", "streamable-http")
+    monkeypatch.setenv("MCP_HOST", "0.0.0.0")
+    monkeypatch.delenv("MCP_ALLOW_REMOTE_UNAUTHENTICATED", raising=False)
+    with pytest.raises(ValueError, match="requires MCP_AUTH_TOKEN"):
+        server_module.main()
+
+
+async def test_bearer_auth_middleware_rejects_missing_or_wrong_tokens():
+    from sqlmesh_mcp.server import _BearerAuthMiddleware
+
+    called = False
+
+    async def app(scope, receive, send):
+        nonlocal called
+        called = True
+
+    responses = []
+
+    async def send(message):
+        responses.append(message)
+
+    middleware = _BearerAuthMiddleware(
+        app,
+        {"client": {"token": "secret-token", "scopes": {"read"}, "expires_at": None}},
+    )
+    scope = {"type": "http", "headers": [(b"authorization", b"Bearer wrong-token")]}
+    await middleware(scope, None, send)
+    assert responses[0]["status"] == 401
+    assert called is False
+
+
+async def test_bearer_auth_middleware_sets_named_client_identity():
+    from sqlmesh_mcp.server import _AUTH_CONTEXT, _BearerAuthMiddleware
+
+    observed = {}
+
+    async def app(scope, receive, send):
+        observed.update(_AUTH_CONTEXT.get() or {})
+
+    async def send(message):
+        return None
+
+    middleware = _BearerAuthMiddleware(
+        app,
+        {"analyst": {"token": "analyst-token", "scopes": {"read"}, "expires_at": None}},
+    )
+    scope = {"type": "http", "headers": [(b"authorization", b"Bearer analyst-token")]}
+    await middleware(scope, None, send)
+    assert observed == {"client_id": "analyst", "scopes": {"read"}}
+
+
+def test_read_scope_cannot_apply_a_plan():
+    import sqlmesh_mcp.server as server_module
+    from sqlmesh_mcp.server import apply_plan
+
+    token = server_module._AUTH_CONTEXT.set({"client_id": "analyst", "scopes": {"read"}})
+    try:
+        with pytest.raises(ToolError, match="lacks scope 'mutate'"):
+            apply_plan("not-a-real-plan", confirm=True)
+    finally:
+        server_module._AUTH_CONTEXT.reset(token)
+
+
+def test_audit_records_include_authenticated_client_identity(tmp_path, monkeypatch):
+    import sqlmesh_mcp.server as server_module
+
+    monkeypatch.setenv("DATAVEIL_AUDIT_LOG_PATH", str(tmp_path / "audit.jsonl"))
+    token = server_module._AUTH_CONTEXT.set({"client_id": "auditor", "scopes": {"read"}})
+    try:
+        server_module._record_audit("test", "model", {"ok": True})
+    finally:
+        server_module._AUTH_CONTEXT.reset(token)
+    assert server_module._audit_log().read_all()[0].detail["client_id"] == "auditor"
+
+
+def test_approval_records_restore_with_original_ids_and_restrictive_permissions(
+    tmp_path, monkeypatch
+):
+    from dataveil.core.approval import PendingPlan
+
+    import sqlmesh_mcp.server as server_module
+
+    approval_path = tmp_path / "approvals.json"
+    monkeypatch.setenv("DATAVEIL_APPROVALS_PATH", str(approval_path))
+    original_records = dict(server_module._PLAN_REGISTRY._plans)
+    try:
+        server_module._PLAN_REGISTRY._plans.clear()
+        pending = PendingPlan(
+            id="durable-plan",
+            table="sqlmesh_example.full_model",
+            plan=[],
+            created_at=1.0,
+            approved=True,
+            approved_by="reviewer",
+            approved_at=2.0,
+        )
+        server_module._PLAN_REGISTRY._plans[pending.id] = pending
+        server_module._persist_approvals()
+        server_module._PLAN_REGISTRY._plans.clear()
+        server_module._load_approvals()
+        restored = server_module._PLAN_REGISTRY.get("durable-plan")
+        assert restored is not None
+        assert restored.approved_by == "reviewer"
+        assert approval_path.stat().st_mode & 0o777 == 0o600
+    finally:
+        server_module._PLAN_REGISTRY._plans.clear()
+        server_module._PLAN_REGISTRY._plans.update(original_records)
+
+
 def test_get_model_raises_tool_error_with_the_real_message_for_unknown_model():
     from sqlmesh_mcp.server import get_model
 
@@ -83,6 +307,24 @@ def test_run_test_passes_on_the_untouched_demo_project():
     assert result["tests_run"] >= 1
     assert result["failures"] == []
     assert result["errors"] == []
+
+
+def test_format_check_reports_sql_files_without_writing_them():
+    from sqlmesh_mcp.server import format
+
+    result = format()
+    assert result == {
+        "check": True,
+        "formatted": False,
+        "needs_formatting": True,
+    }
+
+
+def test_format_refuses_to_write_without_confirm():
+    from sqlmesh_mcp.server import format
+
+    with pytest.raises(ToolError, match="confirm=true"):
+        format(check=False)
 
 
 def test_list_environments_is_empty_before_anything_is_applied():
@@ -118,6 +360,8 @@ def test_plan_previews_the_initial_environment_without_applying():
     }
     # Nothing should have been applied -- the plan is only cached, not run.
     assert result["plan_id"] in _PLAN_CACHE
+    assert _PLAN_CACHE[result["plan_id"]]["environment"] == "dev"
+    assert _PLAN_CACHE[result["plan_id"]]["project_path"]
 
 
 def test_apply_plan_refuses_without_confirm():
@@ -133,6 +377,17 @@ def test_apply_plan_rejects_unknown_plan_id():
 
     with pytest.raises(ToolError, match="No cached plan"):
         apply_plan("not-a-real-plan-id", confirm=True)
+
+
+def test_apply_plan_rejects_an_expired_cached_plan(monkeypatch):
+    import sqlmesh_mcp.server as server_module
+    from sqlmesh_mcp.server import _PLAN_CACHE, apply_plan, plan
+
+    result = plan(environment="expired_check")
+    created_at = _PLAN_CACHE[result["plan_id"]]["created_at"]
+    monkeypatch.setattr(server_module.time, "time", lambda: created_at + 901)
+    with pytest.raises(ToolError, match="expired"):
+        apply_plan(result["plan_id"], confirm=True)
 
 
 def test_apply_plan_actually_applies_when_confirmed():
@@ -175,6 +430,25 @@ def test_diff_environment_shows_no_diff_immediately_after_apply(applied_prod_env
 
     result = diff_environment(applied_prod_env)
     assert result == {"environment": "prod", "has_diff": False}
+
+
+def test_table_diff_returns_structured_equal_table_summary(applied_prod_env):
+    from sqlmesh_mcp.server import table_diff
+
+    result = table_diff(
+        "sqlmesh_example.full_model",
+        "sqlmesh_example.full_model",
+        on=["item_id"],
+    )
+    assert result["source"] == "sqlmesh_example.full_model"
+    assert result["target"] == "sqlmesh_example.full_model"
+    assert len(result["diffs"]) == 1
+    diff = result["diffs"][0]
+    assert diff["key_columns"] == ["item_id"]
+    assert diff["schema"]["added"] == {}
+    assert diff["schema"]["removed"] == {}
+    assert diff["schema"]["modified"] == {}
+    assert diff["rows"]["full_match_count"] == diff["rows"]["source_count"]
 
 
 def test_list_environments_shows_the_applied_environment(applied_prod_env):
@@ -220,6 +494,18 @@ def test_profile_model_never_contains_a_literal_email(applied_prod_env):
     serialized = json.dumps(profile)
     assert "user1@example.com" not in serialized
     assert "@example.com" not in serialized  # not even the constant suffix
+
+
+def test_fetch_model_data_masks_sensitive_columns_by_default(applied_prod_env):
+    from sqlmesh_mcp.server import fetch_model_data
+
+    result = fetch_model_data(
+        "sqlmesh_example.incremental_model",
+        limit=1,
+        columns=["customer_email"],
+    )
+    assert result["masked"] is True
+    assert result["rows"][0]["customer_email"] == "[REDACTED]"
 
 
 def test_propose_cleansing_plan_tags_the_synthetic_email_column(applied_prod_env):

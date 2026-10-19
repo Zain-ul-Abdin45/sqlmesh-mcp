@@ -20,6 +20,7 @@ classifiers = [
 ]
 dependencies = [
     "mcp>=2.0.0",
+    "uvicorn>=0.30.0",
     "sqlmesh>=0.236.0",
     "dataveil[sqlmesh]>=0.2.0",
 ]
